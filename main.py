@@ -3,7 +3,6 @@ import pandas as pd
 import numpy as np
 from sklearn.ensemble import GradientBoostingClassifier
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler
 import os
 
 app = FastAPI()
@@ -11,15 +10,15 @@ DATA_FILE = "eurusd_1m.csv"
 
 @app.get("/")
 def home():
-    return {"status": "EURUSD Binary AI V2 Running"}
+    return {"status": "EURUSD Binary AI V3 Running"}
 
 @app.get("/run-system")
 def run_system():
 
     if not os.path.exists(DATA_FILE):
-        return {"error": "Upload eurusd_1m.csv to repository"}
+        return {"error": "Upload eurusd_1m.csv"}
 
-    # === LOAD DATA ===
+    # LOAD DATA
     df = pd.read_csv(DATA_FILE, sep="\t")
     df["time"] = pd.to_datetime(df["<DATE>"] + " " + df["<TIME>"])
     df = df.sort_values("time")
@@ -31,118 +30,71 @@ def run_system():
 
     df = df[["time","open","high","low","close"]]
 
-    # === FEATURE ENGINEERING ===
-
-    # EMA
-    df["ema9"] = df["close"].ewm(span=9).mean()
-    df["ema21"] = df["close"].ewm(span=21).mean()
-    df["ema_spread"] = df["ema9"] - df["ema21"]
-    df["ema_slope"] = df["ema9"].diff()
-
-    # RSI
-    def rsi(series, period=7):
-        delta = series.diff()
-        gain = delta.clip(lower=0)
-        loss = -delta.clip(upper=0)
-        avg_gain = gain.rolling(period).mean()
-        avg_loss = loss.rolling(period).mean()
-        rs = avg_gain / avg_loss
-        return 100 - (100/(1+rs))
-
-    df["rsi"] = rsi(df["close"])
-    df["rsi_slope"] = df["rsi"].diff()
-
-    # ATR
+    # BASIC FEATURES
     df["range"] = df["high"] - df["low"]
     df["atr"] = df["range"].rolling(7).mean()
     df["atr_pct"] = df["atr"] / df["atr"].rolling(200).mean()
 
-    # Acceleration
-    df["acceleration"] = df["range"] / df["range"].rolling(5).mean()
+    df["avg_range5"] = df["range"].rolling(5).mean()
+    df["compression"] = (df["atr_pct"] < 0.7).astype(int)
+
+    df["acceleration"] = df["range"] / df["avg_range5"]
 
     # Breakout detection
-    df["break_high"] = (df["high"] > df["high"].shift(1).rolling(3).max()).astype(int)
-    df["break_low"] = (df["low"] < df["low"].shift(1).rolling(3).min()).astype(int)
+    df["recent_high"] = df["high"].rolling(5).max().shift(1)
+    df["recent_low"] = df["low"].rolling(5).min().shift(1)
 
-    # ADX approximation
-    df["trend_strength"] = abs(df["ema_spread"])
+    df["break_up"] = (df["high"] > df["recent_high"]).astype(int)
+    df["break_down"] = (df["low"] < df["recent_low"]).astype(int)
 
-    # Consecutive candle direction
-    df["direction"] = np.where(df["close"] > df["open"], 1, 0)
-    df["consecutive"] = df["direction"].groupby((df["direction"] != df["direction"].shift()).cumsum()).cumcount()+1
+    # Expansion trigger
+    df["expansion"] = (df["acceleration"] > 1.5).astype(int)
 
-    # Time features
-    df["hour"] = df["time"].dt.hour
-    df["hour_sin"] = np.sin(2*np.pi*df["hour"]/24)
-    df["hour_cos"] = np.cos(2*np.pi*df["hour"]/24)
+    # Edge Zone definition
+    df["edge_zone"] = (
+        (df["compression"] == 1) &
+        (df["expansion"] == 1) &
+        ((df["break_up"] == 1) | (df["break_down"] == 1))
+    ).astype(int)
 
-    df["day"] = df["time"].dt.dayofweek
+    # Direction of breakout candle
+    df["direction"] = np.where(df["break_up"] == 1, 1,
+                        np.where(df["break_down"] == 1, 0, np.nan))
 
-    # Target
+    # Target = next candle direction
     df["target"] = (df["close"].shift(-1) > df["close"]).astype(int)
 
     df.dropna(inplace=True)
 
-    # === MODEL 1: EDGE DETECTOR ===
-    df["edge_zone"] = (
-        (df["acceleration"] > 1.2) &
-        (df["atr_pct"] > 0.8) &
-        (df["trend_strength"] > df["trend_strength"].median())
-    ).astype(int)
+    eligible = df[df["edge_zone"] == 1].copy()
 
-    edge_features = [
-        "ema_spread","ema_slope","rsi","rsi_slope",
-        "atr_pct","acceleration","trend_strength",
-        "hour_sin","hour_cos"
+    if len(eligible) < 300:
+        return {"error": "Not enough edge trades detected"}
+
+    # MODEL FEATURES
+    features = [
+        "atr_pct",
+        "acceleration",
+        "range"
     ]
 
-    X_edge = df[edge_features]
-    y_edge = df["edge_zone"]
+    X = eligible[features]
+    y = eligible["target"]
 
-    split = int(len(df)*0.8)
+    split = int(len(X)*0.8)
 
-    X_edge_train = X_edge.iloc[:split]
-    X_edge_test = X_edge.iloc[split:]
-    y_edge_train = y_edge.iloc[:split]
-    y_edge_test = y_edge.iloc[split:]
+    X_train = X.iloc[:split]
+    X_test = X.iloc[split:]
+    y_train = y.iloc[:split]
+    y_test = y.iloc[split:]
 
-    edge_model = GradientBoostingClassifier()
-    edge_model.fit(X_edge_train, y_edge_train)
+    model = GradientBoostingClassifier()
+    model.fit(X_train, y_train)
 
-    edge_preds = edge_model.predict(X_edge_test)
+    probs = model.predict_proba(X_test)[:,1]
+    preds = model.predict(X_test)
 
-    df_test = df.iloc[split:].copy()
-    df_test["edge_pred"] = edge_preds
-
-    eligible = df_test[df_test["edge_pred"] == 1]
-
-    # === MODEL 2: DIRECTION ===
-    if len(eligible) < 200:
-        return {"error": "Not enough eligible trades"}
-
-    dir_features = [
-        "ema_spread","ema_slope","rsi","rsi_slope",
-        "acceleration","break_high","break_low",
-        "consecutive","hour_sin","hour_cos"
-    ]
-
-    X_dir = eligible[dir_features]
-    y_dir = eligible["target"]
-
-    split2 = int(len(X_dir)*0.8)
-
-    X_dir_train = X_dir.iloc[:split2]
-    X_dir_test = X_dir.iloc[split2:]
-    y_dir_train = y_dir.iloc[:split2]
-    y_dir_test = y_dir.iloc[split2:]
-
-    dir_model = GradientBoostingClassifier()
-    dir_model.fit(X_dir_train, y_dir_train)
-
-    probs = dir_model.predict_proba(X_dir_test)[:,1]
-    preds = dir_model.predict(X_dir_test)
-
-    eligible_test = eligible.iloc[-len(X_dir_test):].copy()
+    eligible_test = eligible.iloc[-len(X_test):].copy()
     eligible_test["pred"] = preds
     eligible_test["prob"] = probs
 
