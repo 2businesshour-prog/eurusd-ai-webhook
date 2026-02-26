@@ -9,7 +9,7 @@ DATA_FILE = "eurusd_1m.csv"
 
 @app.get("/")
 def home():
-    return {"status": "EURUSD Binary AI V4 Multi-Horizon Running"}
+    return {"status": "EURUSD Binary AI V5 5M Structure Running"}
 
 @app.get("/run-system")
 def run_system():
@@ -17,7 +17,7 @@ def run_system():
     if not os.path.exists(DATA_FILE):
         return {"error": "Upload eurusd_1m.csv"}
 
-    # LOAD DATA
+    # LOAD M1 DATA
     df = pd.read_csv(DATA_FILE, sep="\t")
     df["time"] = pd.to_datetime(df["<DATE>"] + " " + df["<TIME>"])
     df = df.sort_values("time")
@@ -29,68 +29,72 @@ def run_system():
 
     df = df[["time","open","high","low","close"]]
 
-    # FEATURES
-    df["range"] = df["high"] - df["low"]
-    df["atr"] = df["range"].rolling(7).mean()
-    df["atr_pct"] = df["atr"] / df["atr"].rolling(200).mean()
+    # ===============================
+    # RESAMPLE TO 5-MIN STRUCTURE
+    # ===============================
 
-    df["avg_range5"] = df["range"].rolling(5).mean()
-    df["acceleration"] = df["range"] / df["avg_range5"]
+    df_5m = df.set_index("time").resample("5T").agg({
+        "open":"first",
+        "high":"max",
+        "low":"min",
+        "close":"last"
+    }).dropna().reset_index()
 
-    df["ema9"] = df["close"].ewm(span=9).mean()
-    df["ema21"] = df["close"].ewm(span=21).mean()
-    df["ema_spread"] = df["ema9"] - df["ema21"]
+    # 5m FEATURES
+    df_5m["ema20"] = df_5m["close"].ewm(span=20).mean()
+    df_5m["ema50"] = df_5m["close"].ewm(span=50).mean()
+    df_5m["ema_spread"] = df_5m["ema20"] - df_5m["ema50"]
 
-    df["rsi"] = 100 - (100 / (1 + 
-        (df["close"].diff().clip(lower=0).rolling(7).mean() /
-         (-df["close"].diff().clip(upper=0).rolling(7).mean()))
+    df_5m["rsi"] = 100 - (100 / (1 + 
+        (df_5m["close"].diff().clip(lower=0).rolling(14).mean() /
+         (-df_5m["close"].diff().clip(upper=0).rolling(14).mean()))
     ))
 
-    df["hour"] = df["time"].dt.hour
-    df["hour_sin"] = np.sin(2*np.pi*df["hour"]/24)
-    df["hour_cos"] = np.cos(2*np.pi*df["hour"]/24)
+    df_5m["range"] = df_5m["high"] - df_5m["low"]
+    df_5m["atr"] = df_5m["range"].rolling(14).mean()
 
-    df.dropna(inplace=True)
+    df_5m["hour"] = df_5m["time"].dt.hour
+    df_5m["hour_sin"] = np.sin(2*np.pi*df_5m["hour"]/24)
+    df_5m["hour_cos"] = np.cos(2*np.pi*df_5m["hour"]/24)
 
-    # STRUCTURAL FILTER (compression → expansion)
-    df["compression"] = df["atr_pct"] < 0.8
-    df["expansion"] = df["acceleration"] > 1.3
+    df_5m.dropna(inplace=True)
 
-    df["edge_zone"] = (df["compression"] & df["expansion"]).astype(int)
-
-    eligible = df[df["edge_zone"] == 1].copy()
-
-    if len(eligible) < 500:
-        return {"error": "Not enough structural setups"}
-
+    # ===============================
     # MULTI-HORIZON TARGETS
-    horizons = [1,2,3,4,5]
+    # ===============================
+
+    horizons = {
+        "10m": 2,   # 2 x 5m bars
+        "12m": 3,   # approx 15 but we align with 5m
+        "15m": 3
+    }
+
     results = {}
 
-    for h in horizons:
-        eligible[f"target_{h}"] = (
-            eligible["close"].shift(-h) > eligible["close"]
+    for name, h in horizons.items():
+
+        df_5m[f"target_{name}"] = (
+            df_5m["close"].shift(-h) > df_5m["close"]
         ).astype(int)
 
-    eligible.dropna(inplace=True)
+    df_5m.dropna(inplace=True)
 
     features = [
-        "atr_pct",
-        "acceleration",
         "ema_spread",
         "rsi",
+        "atr",
         "hour_sin",
         "hour_cos"
     ]
 
-    split = int(len(eligible)*0.8)
+    split = int(len(df_5m)*0.8)
 
     summary = {}
 
-    for h in horizons:
+    for name in horizons.keys():
 
-        X = eligible[features]
-        y = eligible[f"target_{h}"]
+        X = df_5m[features]
+        y = df_5m[f"target_{name}"]
 
         X_train = X.iloc[:split]
         X_test = X.iloc[split:]
@@ -103,22 +107,21 @@ def run_system():
         probs = model.predict_proba(X_test)[:,1]
         preds = model.predict(X_test)
 
-        test_df = eligible.iloc[split:].copy()
+        test_df = df_5m.iloc[split:].copy()
         test_df["pred"] = preds
         test_df["prob"] = probs
 
         test_df["win"] = (
-            ((test_df["pred"] == 1) & (test_df[f"target_{h}"] == 1)) |
-            ((test_df["pred"] == 0) & (test_df[f"target_{h}"] == 0))
+            ((test_df["pred"] == 1) & (test_df[f"target_{name}"] == 1)) |
+            ((test_df["pred"] == 0) & (test_df[f"target_{name}"] == 0))
         ).astype(int)
 
         raw_winrate = test_df["win"].mean()
 
         high_conf = test_df[test_df["prob"] > 0.60]
-
         filtered_winrate = high_conf["win"].mean() if len(high_conf) > 0 else 0
 
-        summary[f"{h}_minute"] = {
+        summary[name] = {
             "trades": len(test_df),
             "raw_winrate": float(raw_winrate),
             "high_conf_trades": len(high_conf),
