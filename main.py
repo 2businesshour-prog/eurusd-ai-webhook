@@ -1,18 +1,17 @@
 from fastapi import FastAPI
 import pandas as pd
 import numpy as np
-from sklearn.cluster import KMeans
 from sklearn.ensemble import GradientBoostingClassifier
 from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
 import os
 
 app = FastAPI()
-
 DATA_FILE = "eurusd_1m.csv"
 
 @app.get("/")
 def home():
-    return {"status": "EURUSD Binary AI System Running"}
+    return {"status": "EURUSD Binary AI V2 Running"}
 
 @app.get("/run-system")
 def run_system():
@@ -20,9 +19,8 @@ def run_system():
     if not os.path.exists(DATA_FILE):
         return {"error": "Upload eurusd_1m.csv to repository"}
 
-    # === LOAD MT5 DATA ===
+    # === LOAD DATA ===
     df = pd.read_csv(DATA_FILE, sep="\t")
-
     df["time"] = pd.to_datetime(df["<DATE>"] + " " + df["<TIME>"])
     df = df.sort_values("time")
 
@@ -39,6 +37,7 @@ def run_system():
     df["ema9"] = df["close"].ewm(span=9).mean()
     df["ema21"] = df["close"].ewm(span=21).mean()
     df["ema_spread"] = df["ema9"] - df["ema21"]
+    df["ema_slope"] = df["ema9"].diff()
 
     # RSI
     def rsi(series, period=7):
@@ -51,100 +50,116 @@ def run_system():
         return 100 - (100/(1+rs))
 
     df["rsi"] = rsi(df["close"])
+    df["rsi_slope"] = df["rsi"].diff()
 
     # ATR
-    df["atr"] = (df["high"] - df["low"]).rolling(7).mean()
+    df["range"] = df["high"] - df["low"]
+    df["atr"] = df["range"].rolling(7).mean()
     df["atr_pct"] = df["atr"] / df["atr"].rolling(200).mean()
 
-    # Trend strength proxy
+    # Acceleration
+    df["acceleration"] = df["range"] / df["range"].rolling(5).mean()
+
+    # Breakout detection
+    df["break_high"] = (df["high"] > df["high"].shift(1).rolling(3).max()).astype(int)
+    df["break_low"] = (df["low"] < df["low"].shift(1).rolling(3).min()).astype(int)
+
+    # ADX approximation
     df["trend_strength"] = abs(df["ema_spread"])
 
-    # Candle body %
-    df["body"] = abs(df["close"] - df["open"])
-    df["range"] = df["high"] - df["low"]
-    df["body_pct"] = df["body"] / df["range"]
+    # Consecutive candle direction
+    df["direction"] = np.where(df["close"] > df["open"], 1, 0)
+    df["consecutive"] = df["direction"].groupby((df["direction"] != df["direction"].shift()).cumsum()).cumcount()+1
 
-    # Timezone conversion UTC+2 → IST
-    df["time_utc"] = df["time"] - pd.Timedelta(hours=2)
-    df["time_ist"] = df["time_utc"].dt.tz_localize("UTC").dt.tz_convert("Asia/Kolkata")
-    df["hour"] = df["time_ist"].dt.hour
+    # Time features
+    df["hour"] = df["time"].dt.hour
+    df["hour_sin"] = np.sin(2*np.pi*df["hour"]/24)
+    df["hour_cos"] = np.cos(2*np.pi*df["hour"]/24)
 
-    # Target (next candle)
+    df["day"] = df["time"].dt.dayofweek
+
+    # Target
     df["target"] = (df["close"].shift(-1) > df["close"]).astype(int)
 
     df.dropna(inplace=True)
 
-    # === REGIME CLUSTERING ===
-    regime_features = df[["atr_pct","trend_strength","body_pct"]]
+    # === MODEL 1: EDGE DETECTOR ===
+    df["edge_zone"] = (
+        (df["acceleration"] > 1.2) &
+        (df["atr_pct"] > 0.8) &
+        (df["trend_strength"] > df["trend_strength"].median())
+    ).astype(int)
 
-    kmeans = KMeans(n_clusters=4, random_state=42)
-    df["regime"] = kmeans.fit_predict(regime_features)
+    edge_features = [
+        "ema_spread","ema_slope","rsi","rsi_slope",
+        "atr_pct","acceleration","trend_strength",
+        "hour_sin","hour_cos"
+    ]
 
-    # === TRAIN MODEL PER REGIME ===
-    results = {}
+    X_edge = df[edge_features]
+    y_edge = df["edge_zone"]
 
-    total_trades = 0
-    total_wins = 0
+    split = int(len(df)*0.8)
 
-    for regime in df["regime"].unique():
+    X_edge_train = X_edge.iloc[:split]
+    X_edge_test = X_edge.iloc[split:]
+    y_edge_train = y_edge.iloc[:split]
+    y_edge_test = y_edge.iloc[split:]
 
-        sub = df[df["regime"] == regime]
+    edge_model = GradientBoostingClassifier()
+    edge_model.fit(X_edge_train, y_edge_train)
 
-        if len(sub) < 500:
-            continue
+    edge_preds = edge_model.predict(X_edge_test)
 
-        features = sub[[
-            "ema_spread","rsi","atr","atr_pct",
-            "trend_strength","body_pct","hour"
-        ]]
+    df_test = df.iloc[split:].copy()
+    df_test["edge_pred"] = edge_preds
 
-        target = sub["target"]
+    eligible = df_test[df_test["edge_pred"] == 1]
 
-        X_train, X_test, y_train, y_test = train_test_split(
-            features, target, test_size=0.2, shuffle=False
-        )
+    # === MODEL 2: DIRECTION ===
+    if len(eligible) < 200:
+        return {"error": "Not enough eligible trades"}
 
-        model = GradientBoostingClassifier()
-        model.fit(X_train, y_train)
+    dir_features = [
+        "ema_spread","ema_slope","rsi","rsi_slope",
+        "acceleration","break_high","break_low",
+        "consecutive","hour_sin","hour_cos"
+    ]
 
-        preds = model.predict(X_test)
-        probs = model.predict_proba(X_test)[:,1]
+    X_dir = eligible[dir_features]
+    y_dir = eligible["target"]
 
-        sub_test = sub.iloc[-len(X_test):].copy()
-        sub_test["pred"] = preds
-        sub_test["prob"] = probs
+    split2 = int(len(X_dir)*0.8)
 
-        sub_test["win"] = 0
-        sub_test.loc[
-            ((sub_test["pred"] == 1) & (sub_test["target"] == 1)) |
-            ((sub_test["pred"] == 0) & (sub_test["target"] == 0)),
-            "win"
-        ] = 1
+    X_dir_train = X_dir.iloc[:split2]
+    X_dir_test = X_dir.iloc[split2:]
+    y_dir_train = y_dir.iloc[:split2]
+    y_dir_test = y_dir.iloc[split2:]
 
-        regime_trades = len(sub_test)
-        regime_winrate = sub_test["win"].mean()
+    dir_model = GradientBoostingClassifier()
+    dir_model.fit(X_dir_train, y_dir_train)
 
-        high_conf = sub_test[sub_test["prob"] > 0.72]
+    probs = dir_model.predict_proba(X_dir_test)[:,1]
+    preds = dir_model.predict(X_dir_test)
 
-        if len(high_conf) > 0:
-            high_conf_winrate = high_conf["win"].mean()
-        else:
-            high_conf_winrate = 0
+    eligible_test = eligible.iloc[-len(X_dir_test):].copy()
+    eligible_test["pred"] = preds
+    eligible_test["prob"] = probs
 
-        results[f"regime_{regime}"] = {
-            "trades": regime_trades,
-            "winrate": float(regime_winrate),
-            "high_conf_trades": len(high_conf),
-            "high_conf_winrate": float(high_conf_winrate)
-        }
+    eligible_test["win"] = (
+        ((eligible_test["pred"] == 1) & (eligible_test["target"] == 1)) |
+        ((eligible_test["pred"] == 0) & (eligible_test["target"] == 0))
+    ).astype(int)
 
-        total_trades += regime_trades
-        total_wins += sub_test["win"].sum()
+    raw_winrate = eligible_test["win"].mean()
 
-    overall_winrate = total_wins / total_trades if total_trades > 0 else 0
+    high_conf = eligible_test[eligible_test["prob"] > 0.74]
+
+    filtered_winrate = high_conf["win"].mean() if len(high_conf) > 0 else 0
 
     return {
-        "overall_trades": total_trades,
-        "overall_winrate": float(overall_winrate),
-        "regime_breakdown": results
+        "eligible_trades": len(eligible_test),
+        "raw_winrate": float(raw_winrate),
+        "high_conf_trades": len(high_conf),
+        "filtered_winrate": float(filtered_winrate)
     }
