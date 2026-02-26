@@ -2,7 +2,6 @@ from fastapi import FastAPI
 import pandas as pd
 import numpy as np
 from sklearn.ensemble import GradientBoostingClassifier
-from sklearn.model_selection import train_test_split
 import os
 
 app = FastAPI()
@@ -10,7 +9,7 @@ DATA_FILE = "eurusd_1m.csv"
 
 @app.get("/")
 def home():
-    return {"status": "EURUSD Binary AI V3 Running"}
+    return {"status": "EURUSD Binary AI V4 Multi-Horizon Running"}
 
 @app.get("/run-system")
 def run_system():
@@ -30,88 +29,100 @@ def run_system():
 
     df = df[["time","open","high","low","close"]]
 
-    # BASIC FEATURES
+    # FEATURES
     df["range"] = df["high"] - df["low"]
     df["atr"] = df["range"].rolling(7).mean()
     df["atr_pct"] = df["atr"] / df["atr"].rolling(200).mean()
 
     df["avg_range5"] = df["range"].rolling(5).mean()
-    df["compression"] = (df["atr_pct"] < 0.7).astype(int)
-
     df["acceleration"] = df["range"] / df["avg_range5"]
 
-    # Breakout detection
-    df["recent_high"] = df["high"].rolling(5).max().shift(1)
-    df["recent_low"] = df["low"].rolling(5).min().shift(1)
+    df["ema9"] = df["close"].ewm(span=9).mean()
+    df["ema21"] = df["close"].ewm(span=21).mean()
+    df["ema_spread"] = df["ema9"] - df["ema21"]
 
-    df["break_up"] = (df["high"] > df["recent_high"]).astype(int)
-    df["break_down"] = (df["low"] < df["recent_low"]).astype(int)
+    df["rsi"] = 100 - (100 / (1 + 
+        (df["close"].diff().clip(lower=0).rolling(7).mean() /
+         (-df["close"].diff().clip(upper=0).rolling(7).mean()))
+    ))
 
-    # Expansion trigger
-    df["expansion"] = (df["acceleration"] > 1.5).astype(int)
-
-    # Edge Zone definition
-    df["edge_zone"] = (
-        (df["compression"] == 1) &
-        (df["expansion"] == 1) &
-        ((df["break_up"] == 1) | (df["break_down"] == 1))
-    ).astype(int)
-
-    # Direction of breakout candle
-    df["direction"] = np.where(df["break_up"] == 1, 1,
-                        np.where(df["break_down"] == 1, 0, np.nan))
-
-    # Target = next candle direction
-    df["target"] = (df["close"].shift(-1) > df["close"]).astype(int)
+    df["hour"] = df["time"].dt.hour
+    df["hour_sin"] = np.sin(2*np.pi*df["hour"]/24)
+    df["hour_cos"] = np.cos(2*np.pi*df["hour"]/24)
 
     df.dropna(inplace=True)
 
+    # STRUCTURAL FILTER (compression → expansion)
+    df["compression"] = df["atr_pct"] < 0.8
+    df["expansion"] = df["acceleration"] > 1.3
+
+    df["edge_zone"] = (df["compression"] & df["expansion"]).astype(int)
+
     eligible = df[df["edge_zone"] == 1].copy()
 
-    if len(eligible) < 300:
-        return {"error": "Not enough edge trades detected"}
+    if len(eligible) < 500:
+        return {"error": "Not enough structural setups"}
 
-    # MODEL FEATURES
+    # MULTI-HORIZON TARGETS
+    horizons = [1,2,3,4,5]
+    results = {}
+
+    for h in horizons:
+        eligible[f"target_{h}"] = (
+            eligible["close"].shift(-h) > eligible["close"]
+        ).astype(int)
+
+    eligible.dropna(inplace=True)
+
     features = [
         "atr_pct",
         "acceleration",
-        "range"
+        "ema_spread",
+        "rsi",
+        "hour_sin",
+        "hour_cos"
     ]
 
-    X = eligible[features]
-    y = eligible["target"]
+    split = int(len(eligible)*0.8)
 
-    split = int(len(X)*0.8)
+    summary = {}
 
-    X_train = X.iloc[:split]
-    X_test = X.iloc[split:]
-    y_train = y.iloc[:split]
-    y_test = y.iloc[split:]
+    for h in horizons:
 
-    model = GradientBoostingClassifier()
-    model.fit(X_train, y_train)
+        X = eligible[features]
+        y = eligible[f"target_{h}"]
 
-    probs = model.predict_proba(X_test)[:,1]
-    preds = model.predict(X_test)
+        X_train = X.iloc[:split]
+        X_test = X.iloc[split:]
+        y_train = y.iloc[:split]
+        y_test = y.iloc[split:]
 
-    eligible_test = eligible.iloc[-len(X_test):].copy()
-    eligible_test["pred"] = preds
-    eligible_test["prob"] = probs
+        model = GradientBoostingClassifier()
+        model.fit(X_train, y_train)
 
-    eligible_test["win"] = (
-        ((eligible_test["pred"] == 1) & (eligible_test["target"] == 1)) |
-        ((eligible_test["pred"] == 0) & (eligible_test["target"] == 0))
-    ).astype(int)
+        probs = model.predict_proba(X_test)[:,1]
+        preds = model.predict(X_test)
 
-    raw_winrate = eligible_test["win"].mean()
+        test_df = eligible.iloc[split:].copy()
+        test_df["pred"] = preds
+        test_df["prob"] = probs
 
-    high_conf = eligible_test[eligible_test["prob"] > 0.74]
+        test_df["win"] = (
+            ((test_df["pred"] == 1) & (test_df[f"target_{h}"] == 1)) |
+            ((test_df["pred"] == 0) & (test_df[f"target_{h}"] == 0))
+        ).astype(int)
 
-    filtered_winrate = high_conf["win"].mean() if len(high_conf) > 0 else 0
+        raw_winrate = test_df["win"].mean()
 
-    return {
-        "eligible_trades": len(eligible_test),
-        "raw_winrate": float(raw_winrate),
-        "high_conf_trades": len(high_conf),
-        "filtered_winrate": float(filtered_winrate)
-    }
+        high_conf = test_df[test_df["prob"] > 0.60]
+
+        filtered_winrate = high_conf["win"].mean() if len(high_conf) > 0 else 0
+
+        summary[f"{h}_minute"] = {
+            "trades": len(test_df),
+            "raw_winrate": float(raw_winrate),
+            "high_conf_trades": len(high_conf),
+            "filtered_winrate": float(filtered_winrate)
+        }
+
+    return summary
