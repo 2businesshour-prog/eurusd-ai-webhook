@@ -9,7 +9,7 @@ DATA_FILE = "eurusd_1m.csv"
 
 @app.get("/")
 def home():
-    return {"status": "EURUSD Binary AI V5 5M Structure Running"}
+    return {"status": "EURUSD Binary AI V5 Stable Running"}
 
 @app.get("/run-system")
 def run_system():
@@ -17,7 +17,7 @@ def run_system():
     if not os.path.exists(DATA_FILE):
         return {"error": "Upload eurusd_1m.csv"}
 
-    # LOAD M1 DATA
+    # LOAD DATA
     df = pd.read_csv(DATA_FILE, sep="\t")
     df["time"] = pd.to_datetime(df["<DATE>"] + " " + df["<TIME>"])
     df = df.sort_values("time")
@@ -29,10 +29,7 @@ def run_system():
 
     df = df[["time","open","high","low","close"]]
 
-    # ===============================
-    # RESAMPLE TO 5-MIN STRUCTURE
-    # ===============================
-
+    # RESAMPLE TO 5M
     df_5m = df.set_index("time").resample("5T").agg({
         "open":"first",
         "high":"max",
@@ -40,15 +37,24 @@ def run_system():
         "close":"last"
     }).dropna().reset_index()
 
-    # 5m FEATURES
+    if len(df_5m) < 200:
+        return {"error": "Not enough 5m data after resample"}
+
+    # 5M FEATURES
     df_5m["ema20"] = df_5m["close"].ewm(span=20).mean()
     df_5m["ema50"] = df_5m["close"].ewm(span=50).mean()
     df_5m["ema_spread"] = df_5m["ema20"] - df_5m["ema50"]
 
-    df_5m["rsi"] = 100 - (100 / (1 + 
-        (df_5m["close"].diff().clip(lower=0).rolling(14).mean() /
-         (-df_5m["close"].diff().clip(upper=0).rolling(14).mean()))
-    ))
+    # SAFE RSI
+    delta = df_5m["close"].diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+
+    avg_gain = gain.rolling(14).mean()
+    avg_loss = loss.rolling(14).mean()
+
+    rs = avg_gain / (avg_loss + 1e-9)
+    df_5m["rsi"] = 100 - (100 / (1 + rs))
 
     df_5m["range"] = df_5m["high"] - df_5m["low"]
     df_5m["atr"] = df_5m["range"].rolling(14).mean()
@@ -59,20 +65,14 @@ def run_system():
 
     df_5m.dropna(inplace=True)
 
-    # ===============================
-    # MULTI-HORIZON TARGETS
-    # ===============================
-
     horizons = {
-        "10m": 2,   # 2 x 5m bars
-        "12m": 3,   # approx 15 but we align with 5m
+        "10m": 2,
         "15m": 3
     }
 
     results = {}
 
     for name, h in horizons.items():
-
         df_5m[f"target_{name}"] = (
             df_5m["close"].shift(-h) > df_5m["close"]
         ).astype(int)
@@ -100,6 +100,10 @@ def run_system():
         X_test = X.iloc[split:]
         y_train = y.iloc[:split]
         y_test = y.iloc[split:]
+
+        if len(X_test) < 50:
+            summary[name] = {"error": "Not enough test data"}
+            continue
 
         model = GradientBoostingClassifier()
         model.fit(X_train, y_train)
