@@ -3,13 +3,16 @@ import pandas as pd
 import numpy as np
 from sklearn.ensemble import GradientBoostingClassifier
 import os
+import itertools
 
 app = FastAPI()
 DATA_FILE = "eurusd_1m.csv"
 
+PAYOUT = 0.85
+
 @app.get("/")
 def home():
-    return {"status": "EURUSD Binary AI V5 Stable Running"}
+    return {"status": "EURUSD Binary Research Engine Running"}
 
 @app.get("/run-system")
 def run_system():
@@ -17,7 +20,6 @@ def run_system():
     if not os.path.exists(DATA_FILE):
         return {"error": "Upload eurusd_1m.csv"}
 
-    # LOAD DATA
     df = pd.read_csv(DATA_FILE, sep="\t")
     df["time"] = pd.to_datetime(df["<DATE>"] + " " + df["<TIME>"])
     df = df.sort_values("time")
@@ -29,7 +31,7 @@ def run_system():
 
     df = df[["time","open","high","low","close"]]
 
-    # RESAMPLE TO 5 MINUTES (FIXED)
+    # RESAMPLE TO 5m
     df_5m = df.set_index("time").resample("5min").agg({
         "open":"first",
         "high":"max",
@@ -37,96 +39,122 @@ def run_system():
         "close":"last"
     }).dropna().reset_index()
 
-    if len(df_5m) < 200:
-        return {"error": "Not enough 5m data after resample"}
+    if len(df_5m) < 2000:
+        return {"error": "Not enough 5m data"}
 
-    # FEATURES
-    df_5m["ema20"] = df_5m["close"].ewm(span=20).mean()
-    df_5m["ema50"] = df_5m["close"].ewm(span=50).mean()
-    df_5m["ema_spread"] = df_5m["ema20"] - df_5m["ema50"]
-
-    delta = df_5m["close"].diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-
-    avg_gain = gain.rolling(14).mean()
-    avg_loss = loss.rolling(14).mean()
-
-    rs = avg_gain / (avg_loss + 1e-9)
-    df_5m["rsi"] = 100 - (100 / (1 + rs))
-
-    df_5m["range"] = df_5m["high"] - df_5m["low"]
-    df_5m["atr"] = df_5m["range"].rolling(14).mean()
-
-    df_5m["hour"] = df_5m["time"].dt.hour
-    df_5m["hour_sin"] = np.sin(2*np.pi*df_5m["hour"]/24)
-    df_5m["hour_cos"] = np.cos(2*np.pi*df_5m["hour"]/24)
-
+    # TARGETS
+    df_5m["target_10m"] = (df_5m["close"].shift(-2) > df_5m["close"]).astype(int)
+    df_5m["target_15m"] = (df_5m["close"].shift(-3) > df_5m["close"]).astype(int)
     df_5m.dropna(inplace=True)
 
-    horizons = {
-        "10m": 2,
-        "15m": 3
-    }
+    results = []
 
-    for name, h in horizons.items():
-        df_5m[f"target_{name}"] = (
-            df_5m["close"].shift(-h) > df_5m["close"]
-        ).astype(int)
+    # PARAMETER GRID
+    ema_short_list = [10, 20, 30]
+    ema_long_list = [40, 60, 80]
+    rsi_lengths = [7, 14, 21]
+    atr_lengths = [7, 14, 21]
+    prob_thresholds = [0.55, 0.60, 0.65]
 
-    df_5m.dropna(inplace=True)
+    param_grid = list(itertools.product(
+        ema_short_list,
+        ema_long_list,
+        rsi_lengths,
+        atr_lengths,
+        prob_thresholds
+    ))
 
-    features = [
-        "ema_spread",
-        "rsi",
-        "atr",
-        "hour_sin",
-        "hour_cos"
-    ]
+    for ema_s, ema_l, rsi_len, atr_len, prob_th in param_grid:
 
-    split = int(len(df_5m)*0.8)
-
-    summary = {}
-
-    for name in horizons.keys():
-
-        X = df_5m[features]
-        y = df_5m[f"target_{name}"]
-
-        X_train = X.iloc[:split]
-        X_test = X.iloc[split:]
-        y_train = y.iloc[:split]
-        y_test = y.iloc[:split]
-
-        if len(X_test) < 50:
-            summary[name] = {"error": "Not enough test data"}
+        if ema_s >= ema_l:
             continue
 
-        model = GradientBoostingClassifier()
-        model.fit(X_train, y_train)
+        df_tmp = df_5m.copy()
 
-        probs = model.predict_proba(X_test)[:,1]
-        preds = model.predict(X_test)
+        # FEATURES
+        df_tmp["ema_s"] = df_tmp["close"].ewm(span=ema_s).mean()
+        df_tmp["ema_l"] = df_tmp["close"].ewm(span=ema_l).mean()
+        df_tmp["ema_spread"] = df_tmp["ema_s"] - df_tmp["ema_l"]
 
-        test_df = df_5m.iloc[split:].copy()
-        test_df["pred"] = preds
-        test_df["prob"] = probs
+        delta = df_tmp["close"].diff()
+        gain = delta.clip(lower=0)
+        loss = -delta.clip(upper=0)
 
-        test_df["win"] = (
-            ((test_df["pred"] == 1) & (test_df[f"target_{name}"] == 1)) |
-            ((test_df["pred"] == 0) & (test_df[f"target_{name}"] == 0))
-        ).astype(int)
+        avg_gain = gain.rolling(rsi_len).mean()
+        avg_loss = loss.rolling(rsi_len).mean()
 
-        raw_winrate = test_df["win"].mean()
+        rs = avg_gain / (avg_loss + 1e-9)
+        df_tmp["rsi"] = 100 - (100 / (1 + rs))
 
-        high_conf = test_df[test_df["prob"] > 0.60]
-        filtered_winrate = high_conf["win"].mean() if len(high_conf) > 0 else 0
+        df_tmp["range"] = df_tmp["high"] - df_tmp["low"]
+        df_tmp["atr"] = df_tmp["range"].rolling(atr_len).mean()
 
-        summary[name] = {
-            "trades": len(test_df),
-            "raw_winrate": float(raw_winrate),
-            "high_conf_trades": len(high_conf),
-            "filtered_winrate": float(filtered_winrate)
-        }
+        df_tmp.dropna(inplace=True)
 
-    return summary
+        features = ["ema_spread", "rsi", "atr"]
+
+        # WALK FORWARD SPLITS
+        n = len(df_tmp)
+        split1 = int(n * 0.70)
+        split2 = int(n * 0.85)
+
+        folds = [
+            (0, split1, split1, split2),
+            (0, split2, split2, n)
+        ]
+
+        ev_scores = []
+
+        for train_start, train_end, test_start, test_end in folds:
+
+            train = df_tmp.iloc[train_start:train_end]
+            test = df_tmp.iloc[test_start:test_end]
+
+            if len(test) < 200:
+                continue
+
+            X_train = train[features]
+            y_train = train["target_15m"]
+
+            X_test = test[features]
+            y_test = test["target_15m"]
+
+            model = GradientBoostingClassifier()
+            model.fit(X_train, y_train)
+
+            probs = model.predict_proba(X_test)[:,1]
+            preds = (probs > prob_th).astype(int)
+
+            wins = ((preds == 1) & (y_test == 1)) | ((preds == 0) & (y_test == 0))
+            winrate = wins.mean()
+
+            ev = (winrate * PAYOUT) - ((1 - winrate) * 1)
+            ev_scores.append(ev)
+
+        if len(ev_scores) == 2:
+            avg_ev = np.mean(ev_scores)
+            stability = abs(ev_scores[0] - ev_scores[1])
+
+            results.append({
+                "ema_short": ema_s,
+                "ema_long": ema_l,
+                "rsi_len": rsi_len,
+                "atr_len": atr_len,
+                "prob_threshold": prob_th,
+                "avg_ev": float(avg_ev),
+                "stability": float(stability)
+            })
+
+    if not results:
+        return {"error": "No valid configurations"}
+
+    df_results = pd.DataFrame(results)
+    df_results = df_results[df_results["avg_ev"] > 0]
+    df_results = df_results.sort_values(
+        by=["avg_ev", "stability"],
+        ascending=[False, True]
+    )
+
+    top_configs = df_results.head(10)
+
+    return top_configs.to_dict(orient="records")
