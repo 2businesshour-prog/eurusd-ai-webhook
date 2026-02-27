@@ -14,7 +14,7 @@ PAYOUT = 0.85
 def home():
     return {"status": "EURUSD Binary Research Engine Running"}
 
-@app.get("/run-system")
+@app.api_route("/run-system", methods=["GET", "HEAD"])
 def run_system():
 
     if not os.path.exists(DATA_FILE):
