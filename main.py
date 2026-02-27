@@ -7,19 +7,21 @@ import itertools
 
 app = FastAPI()
 DATA_FILE = "eurusd_1m.csv"
-
 PAYOUT = 0.85
 
 @app.get("/")
 def home():
-    return {"status": "EURUSD Binary Research Engine Running"}
+    return {"status": "EURUSD Binary Research Engine Lite Running"}
 
-@app.api_route("/run-system", methods=["GET", "HEAD"])
+@app.get("/run-system")
 def run_system():
 
     if not os.path.exists(DATA_FILE):
         return {"error": "Upload eurusd_1m.csv"}
 
+    # =========================
+    # LOAD DATA
+    # =========================
     df = pd.read_csv(DATA_FILE, sep="\t")
     df["time"] = pd.to_datetime(df["<DATE>"] + " " + df["<TIME>"])
     df = df.sort_values("time")
@@ -31,7 +33,9 @@ def run_system():
 
     df = df[["time","open","high","low","close"]]
 
-    # RESAMPLE TO 5m
+    # =========================
+    # RESAMPLE TO 5 MINUTES
+    # =========================
     df_5m = df.set_index("time").resample("5min").agg({
         "open":"first",
         "high":"max",
@@ -42,19 +46,20 @@ def run_system():
     if len(df_5m) < 2000:
         return {"error": "Not enough 5m data"}
 
-    # TARGETS
-    df_5m["target_10m"] = (df_5m["close"].shift(-2) > df_5m["close"]).astype(int)
-    df_5m["target_15m"] = (df_5m["close"].shift(-3) > df_5m["close"]).astype(int)
+    # 15m TARGET (3 x 5m)
+    df_5m["target"] = (df_5m["close"].shift(-3) > df_5m["close"]).astype(int)
     df_5m.dropna(inplace=True)
 
     results = []
 
-    # PARAMETER GRID
-    ema_short_list = [10, 20, 30]
-    ema_long_list = [40, 60, 80]
-    rsi_lengths = [7, 14, 21]
-    atr_lengths = [7, 14, 21]
-    prob_thresholds = [0.55, 0.60, 0.65]
+    # =========================
+    # SMALL PARAMETER GRID
+    # =========================
+    ema_short_list = [10, 20]
+    ema_long_list = [40, 60]
+    rsi_lengths = [7, 14]
+    atr_lengths = [7, 14]
+    prob_thresholds = [0.55, 0.60]
 
     param_grid = list(itertools.product(
         ema_short_list,
@@ -71,7 +76,9 @@ def run_system():
 
         df_tmp = df_5m.copy()
 
+        # =========================
         # FEATURES
+        # =========================
         df_tmp["ema_s"] = df_tmp["close"].ewm(span=ema_s).mean()
         df_tmp["ema_l"] = df_tmp["close"].ewm(span=ema_l).mean()
         df_tmp["ema_spread"] = df_tmp["ema_s"] - df_tmp["ema_l"]
@@ -93,7 +100,6 @@ def run_system():
 
         features = ["ema_spread", "rsi", "atr"]
 
-        # WALK FORWARD SPLITS
         n = len(df_tmp)
         split1 = int(n * 0.70)
         split2 = int(n * 0.85)
@@ -114,10 +120,10 @@ def run_system():
                 continue
 
             X_train = train[features]
-            y_train = train["target_15m"]
+            y_train = train["target"]
 
             X_test = test[features]
-            y_test = test["target_15m"]
+            y_test = test["target"]
 
             model = GradientBoostingClassifier()
             model.fit(X_train, y_train)
@@ -149,12 +155,18 @@ def run_system():
         return {"error": "No valid configurations"}
 
     df_results = pd.DataFrame(results)
+
+    # Keep only profitable configs
     df_results = df_results[df_results["avg_ev"] > 0]
+
+    if df_results.empty:
+        return {"message": "No profitable stable configurations found"}
+
     df_results = df_results.sort_values(
         by=["avg_ev", "stability"],
         ascending=[False, True]
     )
 
-    top_configs = df_results.head(10)
+    top_configs = df_results.head(5)
 
     return top_configs.to_dict(orient="records")
