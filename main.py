@@ -29,8 +29,8 @@ def run_system():
 
     df = df[["time","open","high","low","close"]]
 
-    # RESAMPLE TO 5M
-    df_5m = df.set_index("time").resample("5T").agg({
+    # RESAMPLE TO 5 MINUTES (FIXED)
+    df_5m = df.set_index("time").resample("5min").agg({
         "open":"first",
         "high":"max",
         "low":"min",
@@ -40,12 +40,11 @@ def run_system():
     if len(df_5m) < 200:
         return {"error": "Not enough 5m data after resample"}
 
-    # 5M FEATURES
+    # FEATURES
     df_5m["ema20"] = df_5m["close"].ewm(span=20).mean()
     df_5m["ema50"] = df_5m["close"].ewm(span=50).mean()
     df_5m["ema_spread"] = df_5m["ema20"] - df_5m["ema50"]
 
-    # SAFE RSI
     delta = df_5m["close"].diff()
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
@@ -69,8 +68,6 @@ def run_system():
         "10m": 2,
         "15m": 3
     }
-
-    results = {}
 
     for name, h in horizons.items():
         df_5m[f"target_{name}"] = (
@@ -99,7 +96,7 @@ def run_system():
         X_train = X.iloc[:split]
         X_test = X.iloc[split:]
         y_train = y.iloc[:split]
-        y_test = y.iloc[split:]
+        y_test = y.iloc[:split]
 
         if len(X_test) < 50:
             summary[name] = {"error": "Not enough test data"}
